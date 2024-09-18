@@ -1,0 +1,218 @@
+// Definir los años para el procesamiento
+var years = ee.List.sequence(1986, 2023);
+
+// Definir las plantillas de los asset IDs
+var assetTemplate507 = 'projects/ee-capdevilajon/assets/507/YEAR_507-507_Psylv_landsat';
+var assetTemplate556 = 'projects/ee-capdevilajon/assets/556/YEAR_556-556_Psylv_landsat';
+
+// Cargar el archivo de SPEI para obtener la geometría
+var spei = ee.Image('projects/ee-capdevilajon/assets/recorteSPEI/spei12_clipped');
+var speiGeometry = spei.geometry();
+
+// Función para calcular el EVI para un conjunto de bandas
+var calculateEVI = function(image, nirBand, redBand, blueBand) {
+  return image.expression(
+    '2.5 * ((NIR - RED) / (NIR + 6 * RED - 7.5 * BLUE + 1))', {
+      'NIR': image.select(nirBand),  // Banda NIR
+      'RED': image.select(redBand),  // Banda Roja
+      'BLUE': image.select(blueBand) // Banda Azul
+  }).rename('EVI');
+};
+
+// Función para calcular el NDVI para un conjunto de bandas
+var calculateNDVI = function(image, nirBand, redBand) {
+  return image.expression(
+    '(NIR - RED) / (NIR + RED)', {
+      'NIR': image.select(nirBand),  // Banda NIR
+      'RED': image.select(redBand)   // Banda Roja
+  }).rename('NDVI');
+};
+
+// Función para normalizar el índice entre -1 y 1
+var normalizeIndex = function(image, indexName) {
+  var minMax = image.reduceRegion({
+    reducer: ee.Reducer.minMax(),
+    geometry: speiGeometry,
+    scale: 30,
+    maxPixels: 1e13
+  });
+  var min = ee.Number(minMax.get(indexName + '_min'));
+  var max = ee.Number(minMax.get(indexName + '_max'));
+  return image.subtract(min).divide(max.subtract(min)).multiply(2).subtract(1).rename(indexName);
+};
+
+// Lista para almacenar los valores medios de EVI y NDVI
+var eviList = [];
+var ndviList = [];
+
+// Función para procesar y exportar imágenes para un año específico
+var processAndExport = function(year) {
+  var yearStr = ee.Number(year).format('%d').getInfo();
+
+  var assetId507 = assetTemplate507.replace('YEAR', yearStr);
+  var assetId556 = assetTemplate556.replace('YEAR', yearStr);
+
+  var image507 = ee.Image(assetId507);
+  var image556 = ee.Image(assetId556);
+
+  // Combinar las dos imágenes usando mosaic
+  var mergedImage = ee.ImageCollection([image507, image556]).mosaic();
+
+  // Seleccionar bandas de verano (junio, julio, agosto)
+  var summerBands = mergedImage.select([
+    'b31', 'b32', 'b33', 'b34', 'b35', 'b36',
+    'b37', 'b38', 'b39', 'b40', 'b41', 'b42',
+    'b43', 'b44', 'b45', 'b46', 'b47', 'b48'
+  ]);
+
+  // Renombrar las bandas seleccionadas para claridad
+  var renamedBands = summerBands.select([
+    'b31', 'b32', 'b33', 'b34', 'b35', 'b36',
+    'b37', 'b38', 'b39', 'b40', 'b41', 'b42',
+    'b43', 'b44', 'b45', 'b46', 'b47', 'b48'
+  ], [
+    'SR_B1_06', 'SR_B2_06', 'SR_B3_06', 'SR_B4_06', 'SR_B5_06', 'SR_B7_06',
+    'SR_B1_07', 'SR_B2_07', 'SR_B3_07', 'SR_B4_07', 'SR_B5_07', 'SR_B7_07',
+    'SR_B1_08', 'SR_B2_08', 'SR_B3_08', 'SR_B4_08', 'SR_B5_08', 'SR_B7_08'
+  ]);
+
+  // Calcular el EVI para cada mes
+  var eviJune = calculateEVI(renamedBands, 'SR_B5_06', 'SR_B4_06', 'SR_B2_06');
+  var eviJuly = calculateEVI(renamedBands, 'SR_B5_07', 'SR_B4_07', 'SR_B2_07');
+  var eviAugust = calculateEVI(renamedBands, 'SR_B5_08', 'SR_B4_08', 'SR_B2_08');
+
+  // Calcular el NDVI para cada mes
+  var ndviJune = calculateNDVI(renamedBands, 'SR_B5_06', 'SR_B4_06');
+  var ndviJuly = calculateNDVI(renamedBands, 'SR_B5_07', 'SR_B4_07');
+  var ndviAugust = calculateNDVI(renamedBands, 'SR_B5_08', 'SR_B4_08');
+
+  // Promediar los EVIs y NDVIs de los tres meses
+  var eviSummer = eviJune.add(eviJuly).add(eviAugust).divide(3).rename('EVI');
+  var ndviSummer = ndviJune.add(ndviJuly).add(ndviAugust).divide(3).rename('NDVI');
+
+  // Normalizar los índices
+  var eviNormalized = normalizeIndex(eviSummer, 'EVI');
+  var ndviNormalized = normalizeIndex(ndviSummer, 'NDVI');
+
+  // Multiplicar por -1 para invertir los valores
+  eviNormalized = eviNormalized.multiply(-1);
+  ndviNormalized = ndviNormalized.multiply(-1);
+
+  // Recortar los índices para que coincidan con la geometría del SPEI
+  var eviClipped = eviNormalized.clip(speiGeometry);
+  var ndviClipped = ndviNormalized.clip(speiGeometry);
+
+  // Obtener el valor medio de EVI y NDVI para el año
+  var eviMean = eviClipped.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: speiGeometry,
+    scale: 30,
+    maxPixels: 1e13
+  }).get('EVI');
+
+  var ndviMean = ndviClipped.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: speiGeometry,
+    scale: 30,
+    maxPixels: 1e13
+  }).get('NDVI');
+
+  // Añadir los valores medios a las listas
+  eviList.push(ee.Feature(null, {'year': year, 'EVI': eviMean}));
+  ndviList.push(ee.Feature(null, {'year': year, 'NDVI': ndviMean}));
+
+  // Exportar la imagen combinada con el EVI y NDVI como un asset
+  var descriptionEVI = 'Merged_Image_EVI_' + yearStr;
+  var assetIdEVI = 'projects/ee-capdevilajon/assets/' + descriptionEVI;
+
+  var descriptionNDVI = 'Merged_Image_NDVI_' + yearStr;
+  var assetIdNDVI = 'projects/ee-capdevilajon/assets/' + descriptionNDVI;
+
+  // Define la región de interés usando la geometría del SPEI
+  var region = speiGeometry;
+
+  // Exportar EVI a Google Drive
+  Export.image.toDrive({
+    image: eviClipped,
+    description: descriptionEVI,
+    scale: 30,  // Mantener la escala de píxel original
+    crs: 'EPSG:25830',
+    maxPixels: 1e13,
+    region: region
+  });
+
+  // Exportar EVI como asset a Google Earth Engine
+  Export.image.toAsset({
+    image: eviClipped,
+    description: descriptionEVI,
+    assetId: assetIdEVI,
+    scale: 30,  // Mantener la escala de píxel original
+    crs: 'EPSG:25830',
+    maxPixels: 1e13,
+    region: region
+  });
+
+  // Exportar NDVI a Google Drive
+  Export.image.toDrive({
+    image: ndviClipped,
+    description: descriptionNDVI,
+    scale: 30,  // Mantener la escala de píxel original
+    crs: 'EPSG:25830',
+    maxPixels: 1e13,
+    region: region
+  });
+
+  // Exportar NDVI como asset a Google Earth Engine
+  Export.image.toAsset({
+    image: ndviClipped,
+    description: descriptionNDVI,
+    assetId: assetIdNDVI,
+    scale: 30,  // Mantener la escala de píxel original
+    crs: 'EPSG:25830',
+    maxPixels: 1e13,
+    region: region
+  });
+
+  // Añadir los índices al mapa
+  Map.addLayer(eviClipped, {min: -1, max: 1, palette: ['blue', 'white', 'green']}, 'EVI ' + yearStr, false);
+  Map.addLayer(ndviClipped, {min: -1, max: 1, palette: ['red', 'white', 'green']}, 'NDVI ' + yearStr, false);
+};
+
+// Iterar sobre los años para procesar todas las imágenes
+years.getInfo().forEach(function(year) {
+  processAndExport(year);
+});
+
+// Crear las colecciones de features para los valores medios de EVI y NDVI
+var eviFeatureCollection = ee.FeatureCollection(eviList);
+var ndviFeatureCollection = ee.FeatureCollection(ndviList);
+
+// Generar los gráficos de EVI y NDVI medios
+var eviChart = ui.Chart.feature.byFeature(eviFeatureCollection, 'year', 'EVI')
+  .setChartType('LineChart')
+  .setOptions({
+    title: 'Mean EVI Over Time',
+    hAxis: {title: 'Year'},
+    vAxis: {title: 'EVI'},
+    lineWidth: 1,
+    pointSize: 3,
+  });
+
+var ndviChart = ui.Chart.feature.byFeature(ndviFeatureCollection, 'year', 'NDVI')
+  .setChartType('LineChart')
+  .setOptions({
+    title: 'Mean NDVI Over Time',
+    hAxis: {title: 'Year'},
+    vAxis: {title: 'NDVI'},
+    lineWidth: 1,
+    pointSize: 3,
+  });
+
+// Añadir los gráficos al panel
+var panel = ui.Panel();
+panel.add(eviChart);
+panel.add(ndviChart);
+Map.add(panel);
+
+// Centrar el mapa en la región de interés (ajusta la geometría según sea necesario)
+Map.centerObject(speiGeometry, 6);
