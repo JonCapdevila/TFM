@@ -1,0 +1,227 @@
+// Cargar el área de interés (AOI) para recortar como imagen y extraer la geometría
+var aoi = ee.Image('projects/ee-capdevilajon/assets/AOI_Extent');
+var aoiGeometry = aoi.geometry();
+
+// Cargar la nueva máscara binaria
+var binaryMask = ee.Image('projects/ee-capdevilajon/assets/PINUS_EVI_MASK');  // Ajusta este ID según sea necesario
+
+// Definir los años de sequía y los años alrededor
+var droughtYears = [1990, 2002, 2012, 2019];
+var years = ee.List([]);
+
+// Añadir cuatro años antes y después de cada año de sequía
+droughtYears.forEach(function(year) {
+  for (var i = -4; i <= 4; i++) {
+    years = years.add(year + i);
+  }
+});
+
+// Eliminar duplicados y ordenar los años
+years = ee.List(years.distinct().sort());
+
+// Definir las plantillas de los asset IDs
+var assetTemplate507 = 'projects/ee-capdevilajon/assets/507/YEAR_507-507_Psylv_landsat';
+var assetTemplate556 = 'projects/ee-capdevilajon/assets/556/YEAR_556-556_Psylv_landsat';
+
+// Función para calcular el EVI para un conjunto de bandas
+var calculateEVI = function(image, nirBand, redBand, blueBand) {
+  return image.expression(
+    '2.5 * ((NIR - RED) / (NIR + 6 * RED - 7.5 * BLUE + 1))', {
+      'NIR': image.select(nirBand),  // Banda NIR
+      'RED': image.select(redBand),  // Banda Roja
+      'BLUE': image.select(blueBand) // Banda Azul
+  }).rename('EVI');
+};
+
+// Función para normalizar el índice entre -1 y 1
+var normalizeIndex = function(image, indexName) {
+  var minMax = image.reduceRegion({
+    reducer: ee.Reducer.minMax(),
+    geometry: aoiGeometry,
+    scale: 30,
+    maxPixels: 1e13
+  });
+  var min = ee.Number(minMax.get(indexName + '_min'));
+  var max = ee.Number(minMax.get(indexName + '_max'));
+  return image.subtract(min).divide(max.subtract(min)).multiply(2).subtract(1).rename(indexName);
+};
+
+// Lista para almacenar las imágenes EVI
+var eviImages = ee.List([]);
+
+// Función para verificar la existencia de un asset
+var assetExists = function(assetId) {
+  try {
+    ee.Image(assetId).getInfo();
+    return true;
+  } catch (e) {
+    return false;
+  }
+};
+
+// Función para manejar outliers usando el método del rango intercuartílico (IQR)
+var handleOutliers = function(image) {
+  var values = image.reduceRegion({
+    reducer: ee.Reducer.toList(),
+    geometry: aoiGeometry,
+    scale: 30,
+    maxPixels: 1e13
+  }).get('EVI');
+  
+  values = ee.List(values);
+  var sorted = values.sort();
+  var count = sorted.size();
+  var q1 = sorted.get(ee.Number(count).multiply(0.25).int());
+  var q3 = sorted.get(ee.Number(count).multiply(0.75).int());
+  var iqr = ee.Number(q3).subtract(q1);
+  var lowerFence = ee.Number(q1).subtract(iqr.multiply(1.5));
+  var upperFence = ee.Number(q3).add(iqr.multiply(1.5));
+  
+  var handledImage = image.updateMask(image.gte(lowerFence).and(image.lte(upperFence)));
+  return handledImage;
+};
+
+// Función para procesar y almacenar imágenes EVI para un año específico
+var processAndStoreEVI = function(year) {
+  var yearStr = ee.Number(year).format('%d');
+
+  var assetId507 = assetTemplate507.replace('YEAR', yearStr.getInfo());
+  var assetId556 = assetTemplate556.replace('YEAR', yearStr.getInfo());
+
+  if (assetExists(assetId507) && assetExists(assetId556)) {
+    var image507 = ee.Image(assetId507);
+    var image556 = ee.Image(assetId556);
+
+    var mergedImage = ee.ImageCollection([image507, image556]).mosaic();
+    mergedImage = mergedImage.updateMask(binaryMask);
+
+    var summerBands = mergedImage.select([
+      'b31', 'b32', 'b33', 'b34', 'b35', 'b36',
+      'b37', 'b38', 'b39', 'b40', 'b41', 'b42',
+      'b43', 'b44', 'b45', 'b46', 'b47', 'b48'
+    ]);
+
+    var renamedBands = summerBands.select([
+      'b31', 'b32', 'b33', 'b34', 'b35', 'b36',
+      'b37', 'b38', 'b39', 'b40', 'b41', 'b42',
+      'b43', 'b44', 'b45', 'b46', 'b47', 'b48'
+    ], [
+      'SR_B1_06', 'SR_B2_06', 'SR_B3_06', 'SR_B4_06', 'SR_B5_06', 'SR_B7_06',
+      'SR_B1_07', 'SR_B2_07', 'SR_B3_07', 'SR_B4_07', 'SR_B5_07', 'SR_B7_07',
+      'SR_B1_08', 'SR_B2_08', 'SR_B3_08', 'SR_B4_08', 'SR_B5_08', 'SR_B7_08'
+    ]);
+
+    var eviJune = calculateEVI(renamedBands, 'SR_B5_06', 'SR_B4_06', 'SR_B2_06');
+    var eviJuly = calculateEVI(renamedBands, 'SR_B5_07', 'SR_B4_07', 'SR_B2_07');
+    var eviAugust = calculateEVI(renamedBands, 'SR_B5_08', 'SR_B4_08', 'SR_B2_08');
+
+    var eviSummer = eviJune.add(eviJuly).add(eviAugust).divide(3).rename('EVI');
+    var eviHandled = handleOutliers(eviSummer);
+    var eviNormalized = normalizeIndex(eviHandled, 'EVI');
+    eviNormalized = eviNormalized.multiply(-1);
+    var eviClipped = eviNormalized.clip(aoiGeometry);
+
+    eviImages = eviImages.add(eviClipped.set('year', year));
+
+    Map.addLayer(eviClipped, {min: -1, max: 1, palette: ['blue', 'white', 'green']}, 'EVI ' + yearStr.getInfo(), false);
+    
+    // Exportar la imagen TIFF a Google Drive
+    Export.image.toDrive({
+      image: eviClipped,
+      description: yearStr.getInfo() + '_EVI_Summer_Mean',
+      folder: 'Lloret_Pinus90', // Asegúrate de que este nombre de carpeta exista en tu Google Drive
+      fileNamePrefix: yearStr.getInfo() + '_EVI_',
+      region: aoiGeometry,
+      scale: 30,
+      maxPixels: 1e13
+    });
+  } else {
+    print('Asset not found for year: ' + yearStr.getInfo());
+  }
+};
+
+years.getInfo().forEach(function(year) {
+  processAndStoreEVI(year);
+});
+
+// Función para normalizar una imagen entre 0 y 1
+var normalizeBetweenZeroAndOne = function(image) {
+  var minMax = image.reduceRegion({
+    reducer: ee.Reducer.minMax(),
+    geometry: aoiGeometry,
+    scale: 30,
+    maxPixels: 1e13
+  });
+  var min = ee.Number(minMax.get('EVI_min'));
+  var max = ee.Number(minMax.get('EVI_max'));
+  return image.subtract(min).divide(max.subtract(min)).rename(image.bandNames());
+};
+
+// Calcular los índices de Lloret para cada píxel
+var calculateLloretIndicesPerPixel = function(droughtYear) {
+  var beforeYears = ee.List.sequence(droughtYear - 4, droughtYear - 1);
+  var afterYears = ee.List.sequence(droughtYear + 1, droughtYear + 4);
+
+  var beforeEVI = ee.ImageCollection.fromImages(beforeYears.map(function(year) {
+    return ee.Image(eviImages.filter(ee.Filter.eq('year', year)).get(0));
+  })).mean();
+
+  var droughtEVI = ee.Image(eviImages.filter(ee.Filter.eq('year', droughtYear)).get(0));
+  
+  var afterEVI = ee.ImageCollection.fromImages(afterYears.map(function(year) {
+    return ee.Image(eviImages.filter(ee.Filter.eq('year', year)).get(0));
+  })).mean();
+
+  var resistance = normalizeBetweenZeroAndOne(droughtEVI.divide(beforeEVI)).rename('Resistance_' + droughtYear);
+  var recovery = normalizeBetweenZeroAndOne(afterEVI.divide(droughtEVI)).rename('Recovery_' + droughtYear);
+  var resilience = normalizeBetweenZeroAndOne(afterEVI.divide(beforeEVI)).rename('Resilience_' + droughtYear);
+
+  // Exportar las imágenes TIFF a Google Drive
+  Export.image.toDrive({
+    image: resistance,
+    description: droughtYear + '_Resistance',
+    folder: 'Lloret_Pinus90', // Asegúrate de que este nombre de carpeta exista en tu Google Drive
+    fileNamePrefix: droughtYear + '_Resistance',
+    region: aoiGeometry,
+    scale: 30,
+    maxPixels: 1e13
+  });
+
+  Export.image.toDrive({
+    image: recovery,
+    description: droughtYear + '_Recovery',
+    folder: 'Lloret_Pinus90', // Asegúrate de que este nombre de carpeta exista en tu Google Drive
+    fileNamePrefix: droughtYear + '_Recovery',
+    region: aoiGeometry,
+    scale: 30,
+    maxPixels: 1e13
+  });
+
+  Export.image.toDrive({
+    image: resilience,
+    description: droughtYear + '_Resilience',
+    folder: 'Lloret_Pinus90', // Asegúrate de que este nombre de carpeta exista en tu Google Drive
+    fileNamePrefix: droughtYear + '_Resilience',
+    region: aoiGeometry,
+    scale: 30,
+    maxPixels: 1e13
+  });
+
+  return {
+    'year': droughtYear,
+    'resistance': resistance,
+    'recovery': recovery,
+    'resilience': resilience
+  };
+};
+
+// Calcular y visualizar los índices de Lloret para cada píxel
+droughtYears.forEach(function(droughtYear) {
+  var indices = calculateLloretIndicesPerPixel(droughtYear);
+
+  Map.addLayer(indices.resistance, {min: 0, max: 1, palette: ['red', 'yellow', 'green']}, 'Resistance ' + droughtYear);
+  Map.addLayer(indices.recovery, {min: 0, max: 1, palette: ['red', 'yellow', 'green']}, 'Recovery ' + droughtYear);
+  Map.addLayer(indices.resilience, {min: 0, max: 1, palette: ['red', 'yellow', 'green']}, 'Resilience ' + droughtYear);
+});
+
+Map.centerObject(aoiGeometry, 6);
